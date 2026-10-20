@@ -1,0 +1,32 @@
+[Unit]
+Description=AI Early Web Attack Detection System (Suricata IDS Integration)
+After=network.target suricata.service
+Wants=suricata.service
+
+[Service]
+Type=simple
+# Không chạy toàn bộ ứng dụng dưới quyền root! Chạy bằng user hệ thống thông thường:
+User=idsuser
+Group=idsuser
+WorkingDirectory=/opt/ai-ids
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/ai-ids/venv/bin/python src/main.py --config config.yaml
+
+# Tự động khởi động lại sau 5 giây nếu tiến trình gặp sự cố
+Restart=always
+RestartSec=5s
+
+# Giới hạn tài nguyên và bảo vệ hệ thống
+LimitNOFILE=65536
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
+# Hướng dẫn cấp quyền sudoers tối thiểu cho lệnh ufw mà không cần nhập mật khẩu:
+# Thêm dòng sau vào file /etc/sudoers.d/ai-ids-ufw:
+# idsuser ALL=(ALL) NOPASSWD: /usr/sbin/ufw insert 1 deny from *, /usr/sbin/ufw delete deny from *
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

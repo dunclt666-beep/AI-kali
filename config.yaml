@@ -1,0 +1,170 @@
+# Cấu hình hệ thống AI Early Web Attack Detection tích hợp Suricata
+log:
+  # Đường dẫn log Suricata eve.json. Khi chạy thử dùng data/sample_eve.json, triển khai thực tế đổi thành /var/log/suricata/eve.json
+  path: "data/sample_eve.json"
+  poll_interval: 0.2
+  # Khi khởi động: bỏ qua toàn bộ nội dung log đã có, chỉ xử lý sự kiện mới.
+  # Bật để tránh phát lại log cũ (data/pfsense_eve.json) gây cảnh báo hàng loạt
+  # dù không có cuộc tấn công nào. Đặt false nếu muốn phát lại file log mẫu để demo.
+  start_at_end: true
+
+sliding_window:
+  # N sự kiện gần nhất hoặc T giây gần nhất của cùng một IP nguồn
+  window_size_n: 20
+  window_time_t: 60
+
+scoring:
+  # Hệ số suy giảm EMA S_t = alpha * S_(t-1) + (1 - alpha) * p_t (0.4 để phản ứng cực nhanh)
+  alpha: 0.4
+  # Ngưỡng phát hiện cảnh báo theta
+  theta: 0.6
+  # Ngưỡng mức độ Cao
+  high_threshold: 0.85
+  # Chế độ phát hiện siêu tốc: cảnh báo ngay lập tức khi phát hiện hành vi tấn công rõ rệt
+  fast_detection: true
+
+network:
+  # Cách chọn IP tấn công của mỗi sự kiện:
+  #   "auto" - tự suy luận (khuyến nghị): nếu src_ip là phía server thì lấy dest_ip làm IP tấn công
+  #   "src"  - luôn dùng src_ip như cũ
+  attacker_selection: "auto"
+  # IP của web server (nếu biết chắc). Khi src_ip trùng các IP này, hệ thống dùng dest_ip làm IP tấn công.
+  # Đây cũng là "danh sách miễn nhiễm": các IP này KHÔNG BAO GIỜ bị hiển thị là kẻ tấn công.
+  server_ips: ["192.168.78.132"]
+  # Dải mạng chứa server. IP nằm trong đây được coi là phía server.
+  # Hữu ích khi tấn công từ ngoài vào và attacker ở dải khác. Ví dụ: ["192.168.78.0/24"]
+  protected_networks: []
+  # Cổng dịch vụ phía server, dùng để suy ra phía client khi không xác định được theo IP/dải mạng
+  server_ports: [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 1433, 3306, 3389, 5432, 5900, 6379, 8000, 8008, 8080, 8443, 8888]
+  # Tự động bảo vệ IP của chính máy đang chạy IDS (thường là máy web server).
+  # Lưu lượng hợp lệ của máy này (SSH, DNS, apt, dashboard...) sẽ không bị báo nhầm là tấn công.
+  protect_local_ips: true
+
+alert:
+  # Thời gian chờ phản hồi của quản trị viên (giây)
+  countdown_seconds: 5
+  # TẮT tự động chặn: Chỉ đưa ra cảnh báo âm thanh & giao diện, không can thiệp ngắt kết nối IP
+  auto_block_enabled: false
+  # Khoảng lặng tối thiểu (giây) giữa 2 cảnh báo cùng IP + cùng loại tấn công.
+  # Giúp hệ thống ngừng báo lặp sau khi cuộc tấn công đã dừng.
+  cooldown_seconds: 30
+
+blocking:
+  # Thời gian chặn mặc định (phút)
+  default_duration_minutes: 60
+  # Lệnh chặn IP bằng ufw (cần sudo giới hạn không cần mật khẩu)
+  ufw_block_command: "sudo ufw insert 1 deny from"
+  ufw_unblock_command: "sudo ufw delete deny from"
+
+model:
+  model_path: "models/detector_model.joblib"
+  data_csv_path: "data/sample_dataset.csv"
+
+database:
+  # PostgreSQL server. Set POSTGRES_PASSWORD in the environment; DATABASE_URL
+  # may be used instead of these connection fields.
+  host: "127.0.0.1"
+  port: 5432
+  dbname: "ids_system"
+  user: "ids_user"
+  password: "123456"
+  connect_timeout: 5
+
+paths:
+  login_paths:
+    - "/login"
+    - "/login.php"
+    - "/dvwa/login.php"
+    - "/admin"
+    - "/admin/login"
+    - "/wp-login.php"
+    - "/user/login"
+    - "/auth/login"
+
+attack_user_agents:
+  - "sqlmap"
+  - "nikto"
+  - "hydra"
+  - "nmap"
+  - "gobuster"
+  - "dirbuster"
+  - "wpscan"
+  - "masscan"
+  - "burpsuite"
+  - "acunetix"
+  - "havij"
+  # LƯU Ý: một số công cụ hợp lệ cũng dùng "curl"/"python-requests" (health-check, script nội bộ).
+  # Chỉ thêm 2 mục dưới đây nếu muốn coi chúng là dấu hiệu tấn công; khi đó chúng được xử lý
+  # nhẹ tay theo detection.generic_tool_user_agents (không báo cảnh báo chỉ với 1 request).
+  # - "curl"
+  # - "python-requests"
+
+# --- NGƯỠNG LUẬT PHÁT HIỆN NHANH ---
+# Điều chỉnh nếu hệ thống báo nhầm hoặc bỏ sót. Giá trị mặc định đã được chọn để
+# KHÔNG báo nhầm lưu lượng bình thường (duyệt web, SSH, DNS, apt, dashboard...).
+detection:
+  # Quét cổng: số cổng đích khác nhau tối thiểu trong cửa sổ trượt (nmap quét thật sự đến hàng chục)
+  scan_unique_ports: 12
+  # Hoặc quét chậm: nhiều luồng ngắn (>= scan_short_flows) trải trên >= scan_min_ports cổng
+  scan_short_flows: 15
+  scan_min_ports: 4
+  # DoS: tốc độ gói/giây tối đa của MỘT luồng để coi là SYN/flood (hping3 --flood thường hàng nghìn pps)
+  dos_pps: 400
+  # Hoặc bùng nổ luồng ngắn dồn dập: >= dos_short_flows luồng trong <= dos_burst_seconds
+  # với tổng số gói >= dos_burst_packets
+  dos_short_flows: 18
+  dos_burst_seconds: 3
+  dos_burst_packets: 800
+  # --- Luật HTTP ---
+  # Dò quét file/đường dẫn: cần tỷ lệ 4xx cao và nhiều URL khác nhau
+  http_scan_ratio_4xx: 0.6
+  http_scan_unique_urls: 10
+  # Brute-force đăng nhập: số lần đăng nhập thất bại trong cửa sổ
+  http_bruteforce_login_fails: 5
+  # DoS tầng ứng dụng: số request/giây (kèm tối thiểu 5 request trong cửa sổ)
+  http_dos_req_rate: 25
+  # User-Agent công cụ chung (health-check, script hợp lệ): chỉ cộng điểm nhẹ, không báo ngay
+  generic_tool_user_agents: ["curl", "python-requests"]
+  generic_tool_prob: 0.75
+  # --- Sự kiện cảnh báo Suricata ---
+  # Bỏ qua chữ ký mức thấp/nhiễu (severity >= giá trị này, 1=nghiêm trọng nhất, 3=thấp).
+  # Đặt 4 để tắt hẳn bộ lọc này.
+  suricata_min_severity: 3
+
+whitelist_ips:
+  - "127.0.0.1"
+  - "::1"
+  - "192.168.78.136" # pfSense Gateway
+  - "10.0.0.1"
+
+dashboard:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+# --- CẤU HÌNH PFSENSE (TÙY CHỌN) ---
+pfsense:
+  # Trạng thái kích hoạt cấu hình pfSense
+  enabled: true
+  
+  # Thông tin kết nối SSH
+  host: "192.168.78.136"
+  port: 22
+  username: "admin"  
+  password: "123456"  # Cân nhắc dùng môi trường biến
+  
+  # Lịch lấy log (giây) - Đặt 1s để phát hiện gần như tức thời
+  sync_interval: 1
+  
+  # pfSense tạo thư mục log theo tên interface; collector sẽ dò eve.json trong
+  # /var/log/suricata/suricata_*/ nếu đường dẫn này không tồn tại.
+  suricata_log_path: "/var/log/suricata/eve.json"
+  
+  # Nơi lưu log sau khi sync (sẽ sử dụng LogCollector hiện có)
+  local_log_path: "data/pfsense_eve.json"
+
+  # Bỏ qua toàn bộ log cũ trên pfSense ở lần kết nối đầu tiên (chỉ đọc sự kiện mới).
+  # Bật để tránh phát lại các cuộc tấn công cũ khi khởi động.
+  start_from_end: true
+  
+  # Cách lấy log: "ssh_sftp" (tải file) hoặc "http_webhook"
+  method: "ssh_sftp"
