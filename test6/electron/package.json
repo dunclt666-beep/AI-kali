@@ -1,0 +1,14 @@
+{
+  "name": "ai-ids-desktop",
+  "version": "1.0.0",
+  "description": "AI Early Web Attack Detection System - Electron Desktop App",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:linux": "electron-builder --linux deb"
+  },
+  "devDependencies": {
+    "electron": "^28.2.0",
+    "electron-builder": "^24.9.1"
+  }
+}
