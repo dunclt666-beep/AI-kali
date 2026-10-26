@@ -13,15 +13,17 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import logging
 import os
-import queue
+
 import signal
 import socket
 import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,14 +33,15 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 import yaml
+from src.pg_store import PostgresStore
 
 from src.alert_manager import AlertManager
 from src.blocker import IPBlocker
 from src.collector import LogCollector
-from src.features import SlidingWindowTracker, has_sql_payload_markers
+from src.features import SlidingWindowTracker, has_sql_payload_markers, parse_timestamp
 from src.pfsense_collector import PfSenseLogCollector
 from src.dashboard import APP_CONTEXT, run_dashboard
-from src.db import add_to_whitelist, init_db, purge_expired_blocks
+from src.db import add_to_whitelist, clear_alerts, init_db, purge_expired_blocks
 from src.model import AttackClassifier
 from src.scorer import EarlyDetectionScorer
 
@@ -91,7 +94,36 @@ DEFAULT_DETECTION: dict[str, Any] = {
     # Bỏ qua chữ ký mức thấp/nhiễu (severity >= giá trị này, mặc định 3 = low).
     # Đặt 4 để tắt hoàn toàn bộ lọc.
     "suricata_min_severity": 3,
+    # Bỏ qua sự kiện đã cũ hơn X giây so với hiện tại. Mục đích: khi log bị đọc
+    # lại (replay) hoặc pfSense đồng bộ lại file cũ, sự kiện cũ không tạo cảnh
+    # báo mới. Đặt 0 để tắt bộ lọc (cần cho chế độ phát lại log demo).
+    "max_event_age_seconds": 60.0,
 }
+
+
+def is_stale_event(
+    event: dict[str, Any],
+    max_age_seconds: float,
+    now_ts: float | None = None,
+) -> bool:
+    """True nếu sự kiện Suricata đã cũ hơn ``max_age_seconds`` giây.
+
+    Hàm thuần này là hàng rào chống "bão cảnh báo" khi file log cũ bị phát lại:
+    dù collector có đọc lại bao nhiêu lần, sự kiện cũ vẫn bị bỏ qua trước khi
+    vào pipeline chấm điểm. ``max_age_seconds <= 0`` tắt bộ lọc.
+    """
+    if max_age_seconds is None or float(max_age_seconds) <= 0:
+        return False
+    ts_raw = event.get("timestamp")
+    if not ts_raw:
+        return False
+    try:
+        event_ts = parse_timestamp(ts_raw)
+    except Exception:
+        return False
+    current_ts = time.time() if now_ts is None else float(now_ts)
+    return (current_ts - event_ts) > float(max_age_seconds)
+
 
 
 def evaluate_flow_rules(win_feat: dict[str, Any], detection: dict[str, Any]) -> str | None:
@@ -189,10 +221,24 @@ class SystemManager:
         self.config_path = config_path
         self.config = self.load_config(config_path)
         self.running = threading.Event()
-        self.event_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=20000)
+        # self.event_queue removed; using DB-based event claims
+
+        # Mốc bắt đầu phiên chạy: dashboard chỉ hiển thị cảnh báo phát sinh từ
+        # mốc này trở đi, không hiện lại cảnh báo cũ đã lưu trong PostgreSQL.
+        self.session_started_at = datetime.now().isoformat()
+        APP_CONTEXT["session_started_at"] = self.session_started_at
 
         # 1. Khởi tạo PostgreSQL
         init_db(self.config.get("database", {}))
+
+        # Tuỳ chọn: xoá cảnh báo cũ ngay khi khởi động (mặc định tắt).
+        alert_cfg = self.config.get("alert", {}) or {}
+        if bool(alert_cfg.get("clear_on_start", False)):
+            try:
+                removed = clear_alerts()
+                logger.info("Đã xoá %d cảnh báo cũ trong PostgreSQL khi khởi động.", removed)
+            except Exception as ex:
+                logger.error("Không xoá được cảnh báo cũ khi khởi động: %s", ex)
 
         # Nạp IP whitelist ban đầu vào DB
         for w_ip in self.config.get("whitelist_ips", []):
@@ -256,6 +302,11 @@ class SystemManager:
             str(ua).lower()
             for ua in (self.detection.get("generic_tool_user_agents") or [])
         )
+        # Ngưỡng chống phát lại log cũ: sự kiện cũ hơn ngưỡng này bị bỏ qua
+        # trước khi vào pipeline chấm điểm (0 = tắt).
+        self.max_event_age_seconds = float(
+            self.detection.get("max_event_age_seconds", 60.0)
+        )
 
         # 5. Khởi tạo Bộ chặn tường lửa (IP Blocker)
         b_cfg = self.config.get("blocking", {})
@@ -286,11 +337,21 @@ class SystemManager:
             pf_local = str(self.pfsense_collector.local_path)
             log_path = pf_local
             self.config.setdefault("log", {})["path"] = pf_local
+        self.pg_store = PostgresStore(self.config.get('database', {}))
+        if not self.pg_store.init_schema():
+            logger.error("Failed to initialize PostgreSQL schema: %s", self.pg_store.last_error)
         self.collector = LogCollector(
             log_path=log_path,
-            event_queue=self.event_queue,
+            pg_store=self.pg_store,
             poll_interval=float(log_cfg.get("poll_interval", 0.2)),
             start_at_end=bool(log_cfg.get("start_at_end", True)),
+        )
+
+        # 8b. Tham số của Worker AI (batch + nhịp poll)
+        w_cfg = self.config.get("worker", {}) or {}
+        self.worker_batch_size = max(1, int(w_cfg.get("batch_size", 20)))
+        self.worker_poll_interval = max(
+            0.05, float(w_cfg.get("poll_interval", 0.2))
         )
 
         # 9. Danh sach ho tro trich dac trung + thread worker/dashboard
@@ -301,7 +362,11 @@ class SystemManager:
         )
         self.dashboard_thread = None
         self._last_purge = 0.0
-        self._purge_interval = 60.0
+        # Dọn trạng thái định kỳ ngắn để IP đã ngừng tấn công được reset sớm,
+        # không giữ điểm EMA cao gây cảnh báo "dư".
+        self._purge_interval = float(
+            (self.config.get("alert", {}) or {}).get("maintenance_interval_seconds", 10.0)
+        )
         # Bộ nhớ đệm chống xử lý trùng lặp sự kiện (ví dụ khi log bị đọc lại/replay)
         self._recent_event_keys: deque[tuple] = deque(maxlen=5000)
         self._recent_event_key_set: set[tuple] = set()
@@ -360,7 +425,9 @@ class SystemManager:
             "config": self.config,
             "config_path": self.config_path,
             "pfsense_collector": self.pfsense_collector,
-            "queue": self.event_queue,
+            "pg_store": self.pg_store,
+            "worker_batch_size": self.worker_batch_size,
+            "session_started_at": self.session_started_at,
         })
 
     @staticmethod
@@ -396,9 +463,15 @@ class SystemManager:
         # 2. Xoá cửa sổ trượt + điểm tích lũy của các IP đã ngừng gửi sự kiện,
         #    tránh việc tiếp tục cảnh báo sau khi cuộc tấn công đã dừng.
         try:
-            idle_ips = self.window_tracker.idle_ips(
-                now, max(float(self.window_tracker.window_time_t), 1.0)
+            idle_reset = float(
+                (self.config.get("scoring", {}) or {}).get("idle_reset_seconds", 0) or 0
             )
+            idle_seconds = (
+                idle_reset
+                if idle_reset > 0
+                else max(float(self.window_tracker.window_time_t), 1.0)
+            )
+            idle_ips = self.window_tracker.idle_ips(now, idle_seconds)
         except Exception as ex:
             logger.error("Lỗi kiểm tra IP không hoạt động: %s", ex)
             idle_ips = []
@@ -524,194 +597,484 @@ class SystemManager:
         return src
 
     def _process_events_worker(self) -> None:
-        """Luồng công nhân lấy sự kiện từ hàng đợi và thực thi pipeline phát hiện sớm."""
-        logger.info("Luồng EventWorkerThread đã bắt đầu lắng nghe hàng đợi sự kiện.")
+        """Vòng lặp Worker AI: claim raw_events từ PostgreSQL và xử lý từng sự kiện.
+
+        Mỗi sự kiện được claim theo cơ chế lease (an toàn khi có nhiều worker).
+        Sau khi xử lý xong, trạng thái được cập nhật thành ``processed`` hoặc trả
+        lại queue (``pending``) kèm backoff nếu lỗi.
+        """
+        logger.info(
+            "Luồng EventWorkerThread đã bắt đầu (batch=%d, poll=%.2fs).",
+            self.worker_batch_size,
+            self.worker_poll_interval,
+        )
 
         while self.running.is_set():
-            self._run_periodic_maintenance()
             try:
-                event = self.event_queue.get(timeout=0.5)
-            except queue.Empty:
+                self._run_periodic_maintenance()
+            except Exception as ex:
+                logger.error("Lỗi bảo trì định kỳ: %s", ex)
+
+            rows = self.pg_store.claim_pending(limit=self.worker_batch_size)
+            if not rows:
+                time.sleep(self.worker_poll_interval)
                 continue
 
-            try:
-                if self._is_duplicate_event(event):
-                    logger.debug(
-                        "Bỏ qua sự kiện trùng lặp (replay log): %s",
-                        self._event_fingerprint(event),
-                    )
-                    continue
+            for row in rows:
+                if not self.running.is_set():
+                    break
+                self._process_claimed_row(row)
 
-                event_type = event.get("event_type")
-                src_ip = event.get("src_ip")
-                if not src_ip:
-                    continue
-
-                # Xác định IP tấn công thật (tránh báo nhầm IP server khi Suricata ghi src_ip là server)
-                attacker_ip = self._resolve_attacker_ip(event)
-                if attacker_ip is None:
-                    logger.debug(
-                        "Bỏ qua sự kiện %s do phía server tự khởi tạo (src_ip=%s, dest_ip=%s).",
-                        event_type,
-                        src_ip,
-                        event.get("dest_ip"),
-                    )
-                    continue
-                if attacker_ip != src_ip:
-                    logger.debug(
-                        "Sự kiện %s: src_ip=%s được xác định là phía server, "
-                        "dùng IP tấn công=%s (dest_ip=%s, dest_port=%s)",
-                        event_type,
-                        src_ip,
-                        attacker_ip,
-                        event.get("dest_ip"),
-                        event.get("dest_port"),
-                    )
-                    event["src_ip"] = attacker_ip
-                    src_ip = attacker_ip
-
-                # Không bao giờ coi phía server (server_ips / dải mạng bảo vệ / IP của chính
-                # máy chạy IDS) là kẻ tấn công -> tránh cảnh báo giả hàng loạt từ lưu lượng
-                # hợp lệ của web server (SSH, DNS, apt, dashboard, ...).
-                if self._is_protected_ip(src_ip):
-                    logger.debug(
-                        "Bỏ qua sự kiện %s từ IP phía server %s (không coi là kẻ tấn công).",
-                        event_type,
-                        src_ip,
-                    )
-                    continue
-
-                # 1. XỬ LÝ SỰ KIỆN ALERT (Suricata đã bắt được chữ ký tấn công)
-                if event_type == "alert":
-                    alert_obj = event.get("alert", {})
-                    sig = str(alert_obj.get("signature", "")).lower()
-                    try:
-                        sig_severity = int(alert_obj.get("severity", 3))
-                    except (TypeError, ValueError):
-                        sig_severity = 3
-
-                    # Bỏ qua chữ ký mức thấp/nhiễu (severity >= suricata_min_severity)
-                    if sig_severity >= int(self.detection.get("suricata_min_severity", 3)):
-                        logger.debug(
-                            "Bỏ qua cảnh báo Suricata mức thấp (severity=%s): %s",
-                            sig_severity,
-                            sig,
-                        )
-                        continue
-
-                    self.window_tracker.add_event(event, self.login_paths)
-
-                    if any(k in sig for k in ("sql", "sqli", "injection")):
-                        att = "sqli"
-                    elif any(k in sig for k in ("scan", "nmap", "portscan", "sweep")):
-                        att = "scan"
-                    elif any(k in sig for k in ("brute", "login", "hydra", "auth")):
-                        att = "bruteforce"
-                    elif any(k in sig for k in ("dos", "ddos", "flood")):
-                        att = "dos"
-                    else:
-                        att = "anomaly"
-
-                    # Điểm p_t theo mức độ chữ ký (severity 1 = nghiêm trọng nhất)
-                    p_t = 0.98 if sig_severity <= 1 else 0.9
-                    current_score, severity, is_alert = self.scorer.update_score(src_ip=src_ip, p_t=p_t)
-                    if is_alert and severity:
-                        self.alert_manager.process_score(
-                            src_ip=src_ip,
-                            attack_type=att,
-                            score=current_score,
-                            severity=severity,
-                        )
-                    continue
-
-                # 2. XỬ LÝ SỰ KIỆN FLOW (Phát hiện siêu tốc Nmap Port Scan & DoS SYN Flood)
-                if event_type == "flow":
-                    self.window_tracker.add_event(event, self.login_paths)
-                    win_feat = self.window_tracker.extract_window_features(src_ip)
-
-                    # Luật chặt: quét cổng cần rất nhiều cổng đích khác nhau,
-                    # DoS cần tốc độ gói/giây rất cao hoặc bùng nổ luồng ngắn dồn dập.
-                    flow_attack = evaluate_flow_rules(win_feat, self.detection)
-                    if flow_attack:
-                        p_t = 0.95 if flow_attack == "scan" else 0.96
-                        logger.info(
-                            "Luật Flow phát hiện %s: IP=%s | ports=%s short=%s peak_pps=%.1f (cửa sổ)",
-                            flow_attack.upper(),
-                            src_ip,
-                            win_feat.get("unique_dst_ports"),
-                            win_feat.get("short_flow_count"),
-                            win_feat.get("peak_flow_pps", 0.0),
-                        )
-                        current_score, severity, is_alert = self.scorer.update_score(src_ip=src_ip, p_t=p_t)
-                        if is_alert and severity:
-                            self.alert_manager.process_score(
-                                src_ip=src_ip,
-                                attack_type=flow_attack,
-                                score=current_score,
-                                severity=severity,
-                            )
-                    continue
-
-                # 3. XỬ LÝ SỰ KIỆN HTTP (Web Application Attacks)
-                if event_type == "http":
-                    features = self.window_tracker.get_full_feature_vector(
-                        http_event=event,
-                        login_paths=self.login_paths,
-                        attack_user_agents=self.attack_user_agents,
-                    )
-
-                    # Lấy chuỗi thời gian gần nhất cho LSTM và dự đoán bằng Ensemble AI (RF + LSTM)
-                    seq_input = self.window_tracker.get_feature_sequence(src_ip, seq_len=5)
-                    predicted_class, class_probs, attack_prob = self.classifier.predict(
-                        features, sequence_input=seq_input
-                    )
-
-                    http_obj = event.get("http", {})
-                    ua_str = str(http_obj.get("http_user_agent", "")).lower()
-                    raw_url = str(http_obj.get("url", "") or "")
-
-                    # FAST-TRACK: chỉ ghi đè khi có bằng chứng rõ ràng (User-Agent công cụ,
-                    # payload SQL thật, dò quét hàng loạt, brute-force, DoS). Các URL hợp lệ
-                    # như /delete.php?id=3 hay health-check curl sẽ KHÔNG còn bị báo nhầm.
-                    fast_result = evaluate_http_fasttrack(features, ua_str, raw_url, self.detection)
-                    if fast_result:
-                        predicted_class, attack_prob = fast_result
-                        logger.info(
-                            "Luật HTTP fast-track phát hiện %s: IP=%s | UA=%s | URL=%s",
-                            predicted_class.upper(),
-                            src_ip,
-                            ua_str[:80] or "-",
-                            raw_url[:120] or "-",
-                        )
-                    elif features.get("user_agent_flag", 0.0) > 0.0:
-                        # UA công cụ chung (curl, python-requests...) chỉ cộng điểm vừa phải
-                        # để một health-check đơn lẻ không kích hoạt cảnh báo ngay.
-                        if any(generic in ua_str for generic in self.generic_tool_uas):
-                            attack_prob = max(attack_prob, float(self.detection.get("generic_tool_prob", 0.75)))
-                        else:
-                            attack_prob = max(attack_prob, 0.92)
-
-                    # Tính điểm EMA phát hiện sớm: S_t = alpha * S_(t-1) + (1 - alpha) * p_t
-                    current_score, severity, is_alert = self.scorer.update_score(
-                        src_ip=src_ip,
-                        p_t=attack_prob,
-                    )
-
-                    # Xử lý nếu vượt ngưỡng phát hiện sớm
-                    if is_alert and severity:
-                        self.alert_manager.process_score(
-                            src_ip=src_ip,
-                            attack_type=predicted_class if predicted_class != "normal" else "anomaly",
-                            score=current_score,
-                            severity=severity,
-                        )
-
-            except Exception as ex:
-                logger.error("Lỗi khi xử lý sự kiện log: %s", ex, exc_info=True)
-            finally:
-                self.event_queue.task_done()
+            # Nếu batch vừa xử lý đã đầy, lập tức lấy batch tiếp theo.
+            if len(rows) < self.worker_batch_size:
+                time.sleep(self.worker_poll_interval)
 
         logger.info("EventWorkerThread đã dừng.")
+
+    def _process_claimed_row(self, row: dict[str, Any]) -> None:
+        """Xử lý một bản ghi đã claim và luôn cập nhật trạng thái cuối cùng."""
+        event_id = row.get("id")
+        try:
+            event = row.get("raw_json")
+            if isinstance(event, str):
+                event = json.loads(event)
+            if not isinstance(event, dict):
+                event = {}
+
+            # raw_json chứa nguyên bản EVE; bổ sung các cột chuẩn hóa nếu thiếu.
+            event.setdefault("event_type", row.get("event_type"))
+            event.setdefault("src_ip", row.get("src_ip"))
+            event.setdefault("src_port", row.get("src_port"))
+            event.setdefault("dest_ip", row.get("dest_ip"))
+            event.setdefault("dest_port", row.get("dest_port"))
+            # Giữ id bản ghi PostgreSQL để gắn vào hồ sơ bằng chứng của alert.
+            event["_db_event_id"] = event_id
+
+            self._process_one_event(row, event)
+        except Exception as ex:
+            attempts = int(row.get("processing_attempts") or 1)
+            logger.error(
+                "Lỗi xử lý sự kiện #%s (lần %d): %s",
+                event_id,
+                attempts,
+                ex,
+                exc_info=True,
+            )
+            if attempts >= 3:
+                # Sự kiện hỏng: đánh dấu failed để không chặn queue.
+                self.pg_store.set_processing_status(
+                    event_id, "failed", error_msg=str(ex)[:1000]
+                )
+            else:
+                retry_at = datetime.now() + timedelta(
+                    seconds=min(30, 2 ** attempts)
+                )
+                self.pg_store.set_processing_status(
+                    event_id,
+                    "pending",
+                    error_msg=str(ex)[:1000],
+                    next_retry_at=retry_at,
+                )
+                # Backoff nhỏ để không quay cuồng khi PostgreSQL/AI tạm lỗi.
+                time.sleep(0.2 * attempts)
+            return
+
+        # Xử lý thành công (kể cả sự kiện bị bỏ qua có chủ đích).
+        self.pg_store.set_processing_status(event_id, "processed")
+
+    def _process_one_event(self, row: dict[str, Any], event: dict[str, Any]) -> None:
+        """Chạy pipeline phát hiện cho một sự kiện EVE đã nằm trong PostgreSQL."""
+        # Chống phát lại log cũ: sự kiện quá cũ bị bỏ qua nhưng vẫn được đánh
+        # dấu processed để không quay lại queue.
+        if is_stale_event(event, self.max_event_age_seconds):
+            logger.debug(
+                "Bỏ qua sự kiện cũ (timestamp=%s, quá %.0fs): %s",
+                event.get("timestamp"),
+                self.max_event_age_seconds,
+                event.get("event_type"),
+            )
+            return
+
+        if self._is_duplicate_event(event):
+            logger.debug(
+                "Bỏ qua sự kiện trùng lặp (replay log): %s",
+                self._event_fingerprint(event),
+            )
+            return
+
+        event_type = event.get("event_type")
+        src_ip = event.get("src_ip")
+        if not src_ip:
+            return
+
+        # Xác định IP tấn công thật (tránh báo nhầm IP server khi Suricata ghi
+        # src_ip là phía server).
+        attacker_ip = self._resolve_attacker_ip(event)
+        if attacker_ip is None:
+            logger.debug(
+                "Bỏ qua sự kiện %s do phía server tự khởi tạo (src_ip=%s, dest_ip=%s).",
+                event_type,
+                src_ip,
+                event.get("dest_ip"),
+            )
+            return
+        if attacker_ip != src_ip:
+            logger.debug(
+                "Sự kiện %s: src_ip=%s là phía server, dùng IP tấn công=%s",
+                event_type,
+                src_ip,
+                attacker_ip,
+            )
+            event["src_ip"] = attacker_ip
+            src_ip = attacker_ip
+
+        # Không bao giờ coi phía server / IP của chính máy IDS là kẻ tấn công.
+        if self._is_protected_ip(src_ip):
+            logger.debug(
+                "Bỏ qua sự kiện %s từ IP phía server %s.",
+                event_type,
+                src_ip,
+            )
+            return
+
+        event_id = row.get("id")
+
+        # 1. Alert của Suricata -------------------------------------------------
+        if event_type == "alert":
+            alert_obj = event.get("alert", {}) or {}
+            sig = str(alert_obj.get("signature", "")).lower()
+            try:
+                sig_severity = int(alert_obj.get("severity", 3))
+            except (TypeError, ValueError):
+                sig_severity = 3
+
+            # Bỏ qua chữ ký mức thấp/nhiễu.
+            if sig_severity >= int(self.detection.get("suricata_min_severity", 3)):
+                logger.debug(
+                    "Bỏ qua cảnh báo Suricata mức thấp (severity=%s): %s",
+                    sig_severity,
+                    sig,
+                )
+                return
+
+            self.window_tracker.add_event(event, self.login_paths)
+            features = self.window_tracker.extract_window_features(src_ip)
+
+            if any(k in sig for k in ("sql", "sqli", "injection")):
+                att = "sqli"
+            elif any(k in sig for k in ("scan", "nmap", "portscan", "sweep")):
+                att = "scan"
+            elif any(k in sig for k in ("brute", "login", "hydra", "auth")):
+                att = "bruteforce"
+            elif any(k in sig for k in ("dos", "ddos", "flood")):
+                att = "dos"
+            else:
+                att = "anomaly"
+
+            p_t = 0.98 if sig_severity <= 1 else 0.9
+            current_score, severity, is_alert = self.scorer.update_score(
+                src_ip=src_ip, p_t=p_t
+            )
+
+            self.pg_store.save_features(event_id, event, features)
+            self._persist_prediction(
+                event_id=event_id,
+                model_name="suricata_signature",
+                predicted_label=att,
+                confidence=p_t,
+                severity=severity,
+                explanation={"signature": alert_obj.get("signature")},
+            )
+
+            if is_alert and severity:
+                self._emit_alert(
+                    src_ip=src_ip,
+                    dest_ip=event.get("dest_ip"),
+                    attack_type=att,
+                    score=current_score,
+                    severity=severity,
+                    source="Suricata_Signature",
+                    confidence=p_t,
+                    event=event,
+                    features=features,
+                )
+            return
+
+        # 2. Flow: phát hiện Port Scan / DoS -----------------------------------
+        if event_type == "flow":
+            self.window_tracker.add_event(event, self.login_paths)
+            win_feat = self.window_tracker.extract_window_features(src_ip)
+            self.pg_store.save_features(event_id, event, win_feat)
+
+            flow_attack = evaluate_flow_rules(win_feat, self.detection)
+            if not flow_attack:
+                return
+
+            p_t = 0.95 if flow_attack == "scan" else 0.96
+            logger.info(
+                "Luật Flow phát hiện %s: IP=%s | ports=%s short=%s peak_pps=%.1f",
+                flow_attack.upper(),
+                src_ip,
+                win_feat.get("unique_dst_ports"),
+                win_feat.get("short_flow_count"),
+                win_feat.get("peak_flow_pps", 0.0),
+            )
+            current_score, severity, is_alert = self.scorer.update_score(
+                src_ip=src_ip, p_t=p_t
+            )
+            self._persist_prediction(
+                event_id=event_id,
+                model_name="flow_rule",
+                predicted_label=flow_attack,
+                confidence=p_t,
+                severity=severity,
+                explanation={
+                    "unique_dst_ports": win_feat.get("unique_dst_ports"),
+                    "short_flow_count": win_feat.get("short_flow_count"),
+                    "peak_flow_pps": win_feat.get("peak_flow_pps"),
+                },
+            )
+            if is_alert and severity:
+                self._emit_alert(
+                    src_ip=src_ip,
+                    dest_ip=event.get("dest_ip"),
+                    attack_type=flow_attack,
+                    score=current_score,
+                    severity=severity,
+                    source="Flow_Rule",
+                    confidence=p_t,
+                    event=event,
+                    features=win_feat,
+                )
+            return
+
+        # 3. HTTP: suy luận bằng Ensemble RF + LSTM ---------------------------
+        if event_type == "http":
+            features = self.window_tracker.get_full_feature_vector(
+                http_event=event,
+                login_paths=self.login_paths,
+                attack_user_agents=self.attack_user_agents,
+            )
+
+            seq_input = self.window_tracker.get_feature_sequence(src_ip, seq_len=5)
+            started = time.perf_counter()
+            predicted_class, class_probs, attack_prob = self.classifier.predict(
+                features, sequence_input=seq_input
+            )
+            latency_ms = (time.perf_counter() - started) * 1000.0
+
+            http_obj = event.get("http", {}) or {}
+            ua_str = str(http_obj.get("http_user_agent", "")).lower()
+            raw_url = str(http_obj.get("url", "") or "")
+
+            # Fast-track: bằng chứng rõ ràng (UA công cụ, payload SQL, brute-force...).
+            fast_result = evaluate_http_fasttrack(
+                features, ua_str, raw_url, self.detection
+            )
+            if fast_result:
+                predicted_class, attack_prob = fast_result
+                logger.info(
+                    "Luật HTTP fast-track phát hiện %s: IP=%s | UA=%s | URL=%s",
+                    predicted_class.upper(),
+                    src_ip,
+                    ua_str[:80] or "-",
+                    raw_url[:120] or "-",
+                )
+            elif features.get("user_agent_flag", 0.0) > 0.0:
+                if any(generic in ua_str for generic in self.generic_tool_uas):
+                    attack_prob = max(
+                        attack_prob,
+                        float(self.detection.get("generic_tool_prob", 0.75)),
+                    )
+                else:
+                    attack_prob = max(attack_prob, 0.92)
+
+            current_score, severity, is_alert = self.scorer.update_score(
+                src_ip=src_ip,
+                p_t=attack_prob,
+            )
+
+            self.pg_store.save_features(event_id, event, features)
+
+            source = self._detection_source(fast_result is not None)
+            self._persist_prediction(
+                event_id=event_id,
+                model_name="ensemble",
+                predicted_label=predicted_class,
+                confidence=attack_prob,
+                severity=severity,
+                latency_ms=latency_ms,
+                explanation={
+                    "probabilities": class_probs,
+                    "fast_track": bool(fast_result),
+                    "url": raw_url[:500],
+                    "user_agent": ua_str[:200],
+                    "attack_probability": attack_prob,
+                    "score": current_score,
+                },
+            )
+
+            if is_alert and severity:
+                attack_type = (
+                    predicted_class if predicted_class != "normal" else "anomaly"
+                )
+                self._emit_alert(
+                    src_ip=src_ip,
+                    dest_ip=event.get("dest_ip"),
+                    attack_type=attack_type,
+                    score=current_score,
+                    severity=severity,
+                    source=source,
+                    confidence=attack_prob,
+                    event=event,
+                    features=features,
+                    class_probs=class_probs,
+                )
+            return
+
+        # Các loại khác (dns/tls/...) chỉ lưu raw_events, không chấm điểm.
+        logger.debug("Bỏ qua chấm điểm cho event_type=%s", event_type)
+
+    def _detection_source(self, fast_track: bool) -> str:
+        """Mô tả nguồn phát hiện để dashboard hiển thị."""
+        if fast_track:
+            return "AI_FastTrack"
+        rf_loaded = bool(getattr(self.classifier, "is_rf_loaded", False))
+        lstm_loaded = bool(getattr(self.classifier, "is_lstm_loaded", False))
+        if rf_loaded and lstm_loaded:
+            return "AI_Ensemble"
+        if rf_loaded:
+            return "AI_RandomForest"
+        if lstm_loaded:
+            return "AI_LSTM"
+        return "AI_Heuristic"
+
+    @staticmethod
+    def _risk_level(severity: str | None, confidence: float) -> str:
+        """Chuẩn hóa mức rủi ro sang INFO/LOW/MEDIUM/HIGH/CRITICAL."""
+        if severity == "Cao":
+            return "CRITICAL" if confidence >= 0.95 else "HIGH"
+        if severity == "Trung bình":
+            return "MEDIUM"
+        if confidence >= 0.85:
+            return "HIGH"
+        if confidence >= 0.60:
+            return "MEDIUM"
+        if confidence >= 0.30:
+            return "LOW"
+        return "INFO"
+
+    def _persist_prediction(
+        self,
+        event_id: int,
+        model_name: str,
+        predicted_label: str,
+        confidence: float,
+        severity: str | None,
+        latency_ms: float | None = None,
+        explanation: Any = None,
+    ) -> None:
+        """Ghi kết quả của worker AI vào bảng ai_predictions."""
+        self.pg_store.save_prediction(
+            event_id=event_id,
+            model_name=model_name,
+            model_version="1.0.0",
+            predicted_label=predicted_label or "normal",
+            confidence=float(confidence or 0.0),
+            risk_level=self._risk_level(severity, float(confidence or 0.0)),
+            inference_latency_ms=latency_ms or 0.0,
+            explanation=explanation or {},
+            feature_schema_version="v1.0",
+        )
+
+    def _build_evidence(
+        self,
+        event: dict[str, Any],
+        source: str,
+        features: dict[str, Any] | None = None,
+        class_probs: Any = None,
+    ) -> dict[str, Any]:
+        """Hồ sơ bằng chứng lưu kèm alert để dashboard/forensics đọc lại."""
+        http_obj = event.get("http", {}) or {}
+        alert_obj = event.get("alert", {}) or {}
+        features = features or {}
+        return {
+            "event_id": event.get("_db_event_id"),
+            "suricata": {
+                "signature": alert_obj.get("signature") or event.get("signature"),
+                "category": alert_obj.get("category") or event.get("category"),
+                "severity": alert_obj.get("severity") or event.get("severity"),
+            },
+            "detection_source": source,
+            "ai_models": {"probabilities": class_probs or {}},
+            "web_indicators": {
+                "http_method": http_obj.get("http_method"),
+                "url": http_obj.get("url"),
+                "status": http_obj.get("status"),
+                "user_agent": http_obj.get("http_user_agent"),
+                "hostname": http_obj.get("hostname"),
+            },
+            "features_summary": {
+                "unique_dst_ports": features.get("unique_dst_ports"),
+                "short_flow_count": features.get("short_flow_count"),
+                "peak_flow_pps": features.get("peak_flow_pps"),
+                "req_rate": features.get("req_rate"),
+                "ratio_4xx": features.get("ratio_4xx"),
+                "failed_login_count": features.get("login_fail_count"),
+                "sql_keyword_count": features.get("sql_keyword_count"),
+                "special_char_count": features.get("special_char_count"),
+            },
+            "event": {
+                "flow_id": event.get("flow_id"),
+                "timestamp": event.get("timestamp"),
+                "src_ip": event.get("src_ip"),
+                "src_port": event.get("src_port"),
+                "dest_ip": event.get("dest_ip"),
+                "dest_port": event.get("dest_port"),
+                "proto": event.get("proto"),
+            },
+        }
+
+    def _emit_alert(
+        self,
+        src_ip: str,
+        dest_ip: str | None,
+        attack_type: str,
+        score: float,
+        severity: str,
+        source: str,
+        confidence: float,
+        event: dict[str, Any],
+        features: dict[str, Any] | None = None,
+        class_probs: Any = None,
+    ) -> int | None:
+        """Tạo cảnh báo qua AlertManager (whitelist/cooldown/DB/đếm ngược)."""
+        evidence = self._build_evidence(event, source, features, class_probs)
+        try:
+            alert_id = self.alert_manager.process_score(
+                src_ip=src_ip,
+                attack_type=attack_type,
+                score=score,
+                severity=severity,
+                dest_ip=dest_ip,
+                source_of_detection=source,
+                confidence=confidence,
+                evidence=evidence,
+            )
+        except Exception as ex:
+            logger.error("Không tạo được cảnh báo cho %s: %s", src_ip, ex)
+            return None
+        if alert_id:
+            logger.warning(
+                "CẢNH BÁO #%s [%s] IP=%s loại=%s nguồn=%s điểm=%.3f",
+                alert_id,
+                severity,
+                src_ip,
+                attack_type,
+                source,
+                score,
+            )
+        return alert_id
 
     def stop(self) -> None:
         """Dừng tất cả các thành phần an toàn."""
@@ -724,7 +1087,18 @@ class SystemManager:
         # Dừng bộ thu thập log từ pfSense
         if self.pfsense_collector:
             self.pfsense_collector.stop()
-        
+
+        # Đóng kết nối PostgreSQL sau khi các luồng đã dừng.
+        try:
+            if self.worker_thread.is_alive():
+                self.worker_thread.join(timeout=5)
+        except Exception:
+            pass
+        try:
+            self.pg_store.close()
+        except Exception:
+            pass
+
         logger.info("Hệ thống đã dừng hoàn toàn.")
 
 

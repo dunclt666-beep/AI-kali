@@ -347,7 +347,11 @@ class SlidingWindowTracker:
         Tính toán các đặc trưng mức cửa sổ cho IP nguồn dựa trên lịch sử HTTP, Flow, Alert.
         """
         if current_ts is None:
-            current_ts = datetime.now().timestamp()
+            # Ưu tiên thời điểm của sự kiện gần nhất của IP này thay vì đồng hồ
+            # hiện tại. Nhờ vậy khi worker xử lý log trễ/backlog, cửa sổ trượt
+            # vẫn được tính đúng theo thời gian của chính luồng sự kiện.
+            with self.lock:
+                current_ts = self.last_event_ts.get(src_ip) or datetime.now().timestamp()
 
         with self.lock:
             self._cleanup_old_events(src_ip, current_ts)

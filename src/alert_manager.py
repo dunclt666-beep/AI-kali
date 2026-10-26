@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime
 from typing import Any
 
 from src.blocker import IPBlocker
@@ -60,6 +61,11 @@ class AlertManager:
         attack_type: str,
         score: float,
         severity: str,
+        dest_ip: str | None = None,
+        source_of_detection: str | None = None,
+        confidence: float | None = None,
+        evidence: Any = None,
+        alert_timestamp: datetime | None = None,
     ) -> int | None:
         """
         Tiếp nhận kết quả tính điểm. Nếu vượt ngưỡng, tạo cảnh báo và khởi động đếm ngược.
@@ -110,6 +116,11 @@ class AlertManager:
             score=score,
             severity=severity,
             status=status,
+            dest_ip=dest_ip,
+            source_of_detection=source_of_detection,
+            confidence=confidence,
+            evidence=evidence,
+            alert_timestamp=alert_timestamp,
         )
         logger.warning(
             "CẢNH BÁO SỚM [%s] - IP: %s | Loại: %s | Điểm EMA: %.4f | ID: %d (%s)",

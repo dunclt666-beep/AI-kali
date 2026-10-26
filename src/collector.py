@@ -1,7 +1,7 @@
 """
 Module thu thập log Suricata EVE (Log Collector).
 Đọc tệp eve.json theo phương thức 'tail -f', tự động xử lý log xoay vòng (logrotate/inode tracking),
-đẩy sự kiện đã phân tích vào hàng đợi (Queue) bất đồng bộ trên luồng riêng biệt.
+đẩy sự kiện đã phân tích trực tiếp vào PostgreSQL thông qua PostgresStore.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import queue
+
 import threading
 import time
 from typing import Any
@@ -25,22 +25,19 @@ class LogCollector(threading.Thread):
     def __init__(
         self,
         log_path: str,
-        event_queue: queue.Queue[dict[str, Any]],
+        pg_store: Any,
         poll_interval: float = 0.2,
         start_at_end: bool = True,
     ):
         super().__init__(name="LogCollectorThread", daemon=True)
         self.log_path = os.path.abspath(log_path)
-        self.event_queue = event_queue
+        self.pg_store = pg_store
         self.poll_interval = poll_interval
-        # Khi True: bỏ qua toàn bộ nội dung log đã có lúc khởi động, chỉ xử lý sự kiện mới.
-        # Tránh phát lại log cũ (data/pfsense_eve.json) gây cảnh báo hàng loạt dù không có tấn công.
         self.start_at_end = bool(start_at_end)
         self._stop_event = threading.Event()
-
-        # Thống kê
         self.processed_events = 0
         self.malformed_lines = 0
+        self.last_event_at: float | None = None
         self.last_inode: int | None = None
         self.last_pos: int = 0
 
@@ -145,9 +142,17 @@ class LogCollector(threading.Thread):
 
             try:
                 event_data = json.loads(stripped_line)
-                self.processed_events += 1
-                # Đẩy vào hàng đợi để luồng worker xử lý
-                self.event_queue.put(event_data)
+                # Đẩy sự kiện vào PostgreSQL (raw_events). Worker AI sẽ đọc
+                # các bản ghi processing_status='pending' từ đây.
+                saved = self.pg_store.save_event(event_data)
+                if saved:
+                    self.processed_events += 1
+                    self.last_event_at = time.time()
+                else:
+                    logger.error(
+                        "Không lưu được sự kiện vào PostgreSQL: type=%s",
+                        event_data.get("event_type"),
+                    )
             except json.JSONDecodeError:
                 self.malformed_lines += 1
                 logger.debug("Bỏ qua dòng log JSON không hợp lệ: %s", stripped_line[:100])

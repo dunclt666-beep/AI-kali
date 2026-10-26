@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from src.db import (
     add_to_whitelist,
     clear_alerts,
     get_active_model,
+    get_alert_by_id,
     get_alerts,
     get_blocked_ips,
     get_stats,
@@ -55,6 +57,11 @@ APP_CONTEXT: dict[str, Any] = {
     "config_path": "config.yaml",
     # --- THÊM MỚI: pfSense collector ---
     "pfsense_collector": None,
+    # Kho dữ liệu PostgreSQL dùng cho pipeline collector -> DB -> AI worker.
+    "pg_store": None,
+    # Mốc bắt đầu phiên dashboard. Chỉ cảnh báo phát sinh sau mốc này được hiển
+    # thị mặc định, tránh nhìn thấy lại cảnh báo cũ trong PostgreSQL.
+    "session_started_at": datetime.now().isoformat(),
 }
 
 HTML_TEMPLATE = """
@@ -347,6 +354,17 @@ HTML_TEMPLATE = """
                 <div class="card">
                     <div class="card-title">Sự kiện đã xử lý</div>
                     <div class="card-value" id="stat-events">0</div>
+                    <div id="stat-events-sub" style="font-size: 0.75rem; color: var(--text-muted);"></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Hàng đợi AI (PostgreSQL)</div>
+                    <div class="card-value" id="stat-queue" style="color: var(--accent-yellow);">0</div>
+                    <div id="stat-queue-sub" style="font-size: 0.75rem; color: var(--text-muted);"></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Dự đoán AI</div>
+                    <div class="card-value" id="stat-predictions" style="color: var(--accent-purple);">0</div>
+                    <div id="stat-predictions-sub" style="font-size: 0.75rem; color: var(--text-muted);"></div>
                 </div>
                 <div class="card">
                     <div class="card-title">IP Đang Bị Chặn (UFW)</div>
@@ -354,7 +372,7 @@ HTML_TEMPLATE = """
                 </div>
                 <div class="card">
                     <div class="card-title">pfSense / Suricata Sensor</div>
-                    <div class="card-value" id="stat-pfsense" style="font-size: 1.1rem; color: var(--accent-green);">TAT</div>
+                    <div class="card-value" id="stat-pfsense" style="font-size: 1.1rem; color: var(--accent-green);">TẮT</div>
                     <div id="stat-pfsense-sub" style="font-size: 0.75rem; color: var(--text-muted);"></div>
                 </div>
             </div>
@@ -413,7 +431,8 @@ HTML_TEMPLATE = """
                     <div class="chart-header">
                         <h3>Bảng Theo Dõi Cảnh Báo Phát Hiện Sớm</h3>
                         <div style="display:flex; align-items:center; gap:12px;">
-                            <span style="font-size:0.8rem; color:var(--text-muted);">Chỉ cảnh báo khi có hành vi bất thường thực sự</span>
+                            <span id="alert-scope-note" style="font-size:0.8rem; color:var(--text-muted);">Chỉ cảnh báo phát sinh trong phiên chạy này</span>
+                            <button class="btn btn-secondary" id="btn-alert-history" onclick="toggleAlertHistory()">Hiện cảnh báo cũ</button>
                             <button class="btn btn-secondary" onclick="clearAlerts()">Xóa cảnh báo cũ</button>
                         </div>
                     </div>
@@ -561,7 +580,7 @@ HTML_TEMPLATE = """
                     datasets: [
                         {
                             label: 'IP Đang Theo Dõi (S_t)',
-                            data: [0.1, 0.2, 0.45, 0.65, 0.78, 0.85],
+                            data: [0, 0, 0, 0, 0, 0],
                             borderColor: '#38bdf8',
                             backgroundColor: 'rgba(56, 189, 248, 0.1)',
                             fill: true,
@@ -604,7 +623,7 @@ HTML_TEMPLATE = """
                 data: {
                     labels: ['Normal', 'Scan', 'SQLi', 'Bruteforce', 'DoS'],
                     datasets: [{
-                        data: [1, 1, 1, 1, 1],
+                        data: [0, 0, 0, 0, 0],
                         backgroundColor: ['#10b981', '#38bdf8', '#f59e0b', '#a855f7', '#ef4444'],
                         borderWidth: 0
                     }]
@@ -648,7 +667,7 @@ HTML_TEMPLATE = """
                     labels: ['H-4', 'H-3', 'H-2', 'H-1', 'Bây giờ'],
                     datasets: [{
                         label: 'Cảnh báo',
-                        data: [0, 1, 3, 2, 5],
+                        data: [0, 0, 0, 0, 0],
                         backgroundColor: '#a855f7',
                         borderRadius: 4
                     }]
@@ -674,12 +693,31 @@ HTML_TEMPLATE = """
                 document.getElementById('stat-model').innerText = data.model_status;
                 document.getElementById('stat-events').innerText = data.processed_events;
                 document.getElementById('stat-blocked').innerText = data.blocked_count;
+
+                const pipe = data.pipeline || {};
+                const evSub = document.getElementById('stat-events-sub');
+                if (evSub) {
+                    evSub.innerText = `Nhận: ${pipe.raw_total || 0} | Lỗi: ${pipe.raw_failed || 0}`;
+                }
+                const queueEl = document.getElementById('stat-queue');
+                const queueSub = document.getElementById('stat-queue-sub');
+                if (queueEl) queueEl.innerText = pipe.raw_pending || 0;
+                if (queueSub) {
+                    queueSub.innerText = (pipe.raw_processing ? `Đang xử lý: ${pipe.raw_processing}` : 'Chờ Worker AI')
+                        + (pipe.last_event_at ? ` | Mới nhất: ${pipe.last_event_at.substring(11, 19)}` : '');
+                }
+                const predEl = document.getElementById('stat-predictions');
+                const predSub = document.getElementById('stat-predictions-sub');
+                if (predEl) predEl.innerText = pipe.predictions_total || 0;
+                if (predSub) {
+                    predSub.innerText = `Features: ${pipe.features_total || 0} | Cảnh báo: ${pipe.alerts_total || 0}`;
+                }
                 const pf = data.pfsense;
                 const pfEl = document.getElementById('stat-pfsense');
                 const pfSub = document.getElementById('stat-pfsense-sub');
                 if (pfEl) {
-                    if (!pf) { pfEl.innerText = 'TAT'; if (pfSub) pfSub.innerText = 'enabled=false trong config.yaml'; }
-                    else if (pf.running) { pfEl.innerText = 'Dang chay (' + pf.host + ')'; if (pfSub) pfSub.innerText = 'sync: ' + (pf.last_sync || '...') + ' | batch: ' + pf.synced_batches; }
+                    if (!pf) { pfEl.innerText = 'TẮT'; if (pfSub) pfSub.innerText = 'Không có collector pfSense trong tiến trình này'; }
+                    else if (pf.running) { pfEl.innerText = 'Đang chạy (' + pf.host + ')'; if (pfSub) pfSub.innerText = 'sync: ' + (pf.last_sync || '...') + ' | batch: ' + pf.synced_batches; }
                     else { pfEl.innerText = pf.last_error ? 'Loi ket noi' : 'Da dung'; if (pfSub) pfSub.innerText = pf.last_error || pf.message || ''; }
                 }
             } catch (e) {
@@ -689,7 +727,7 @@ HTML_TEMPLATE = """
 
         async function updateCharts() {
             try {
-                const res = await fetch('/api/stats');
+                const res = await fetch('/api/stats' + alertScopeQuery());
                 const data = await res.json();
 
                 // Cập nhật Doughnut
@@ -713,11 +751,16 @@ HTML_TEMPLATE = """
                 }
 
                 // Cập nhật Timeline
-                if (timelineChart && data.time_series && data.time_series.length > 0) {
-                    const tLabels = data.time_series.map(t => t.time.slice(-5)).reverse();
-                    const tCounts = data.time_series.map(t => t.count).reverse();
-                    timelineChart.data.labels = tLabels;
-                    timelineChart.data.datasets[0].data = tCounts;
+                if (timelineChart) {
+                    if (data.time_series && data.time_series.length > 0) {
+                        const tLabels = data.time_series.map(t => t.time.slice(-5)).reverse();
+                        const tCounts = data.time_series.map(t => t.count).reverse();
+                        timelineChart.data.labels = tLabels;
+                        timelineChart.data.datasets[0].data = tCounts;
+                    } else {
+                        timelineChart.data.labels = ['-4h', '-3h', '-2h', '-1h', 'Bây giờ'];
+                        timelineChart.data.datasets[0].data = [0, 0, 0, 0, 0];
+                    }
                     timelineChart.update();
                 }
             } catch (e) {
@@ -729,6 +772,27 @@ HTML_TEMPLATE = """
         let audioCtx = null;
         let isSoundEnabled = localStorage.getItem('ids_sound_enabled') !== 'false';
         let lastSeenAlertId = -1;
+        let showAlertHistory = false;
+
+        function alertScopeQuery() {
+            return showAlertHistory ? '?include_history=1' : '';
+        }
+
+        function toggleAlertHistory() {
+            showAlertHistory = !showAlertHistory;
+            // Đặt lại mốc để không phát âm thanh cho loạt cảnh báo cũ vừa hiện ra
+            lastSeenAlertId = -1;
+            const btn = document.getElementById('btn-alert-history');
+            const note = document.getElementById('alert-scope-note');
+            if (btn) btn.innerText = showAlertHistory ? 'Chỉ hiện phiên này' : 'Hiện cảnh báo cũ';
+            if (note) {
+                note.innerText = showAlertHistory
+                    ? 'Đang xem toàn bộ lịch sử cảnh báo trong PostgreSQL'
+                    : 'Chỉ cảnh báo phát sinh trong phiên chạy này';
+            }
+            fetchAlerts();
+            updateCharts();
+        }
 
         function updateSoundButton() {
             const btn = document.getElementById('btn-sound-toggle');
@@ -813,12 +877,17 @@ HTML_TEMPLATE = """
 
         async function fetchAlerts() {
             try {
-                const res = await fetch('/api/alerts');
+                const res = await fetch('/api/alerts' + alertScopeQuery());
                 const data = await res.json();
                 const tbody = document.getElementById('tbody-alerts');
 
                 if (!data.alerts || data.alerts.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color:#94a3b8;">Chưa có cảnh báo nào</td></tr>';
+                    // Không còn cảnh báo trong phạm vi đang xem -> đưa biểu đồ S_t về 0
+                    if (lineChart) {
+                        lineChart.data.datasets[0].data = [0, 0, 0, 0, 0, 0];
+                        lineChart.update();
+                    }
                     return;
                 }
 
@@ -838,14 +907,19 @@ HTML_TEMPLATE = """
                     const banner = document.getElementById('live-alert-banner');
                     const text = document.getElementById('live-alert-text');
                     if (banner && text) {
-                        text.innerHTML = `🚨 PHÁT HIỆN TẤN CÔNG [${newAlert.attack_type.toUpperCase()}] từ IP: ${newAlert.src_ip} | Điểm EMA: ${newAlert.score.toFixed(4)} (${newAlert.severity})`;
+                        text.innerHTML = `🚨 PHÁT HIỆN TẤN CÔNG [${(newAlert.attack_type || 'unknown').toUpperCase()}] từ IP: ${newAlert.src_ip} | Điểm EMA: ${Number(newAlert.score || 0).toFixed(4)} (${newAlert.severity || '-'})`;
                         banner.style.display = 'flex';
+                        // Tự ẩn banner sau 10 giây để không gây cảm giác "vẫn đang bị tấn công"
+                        clearTimeout(window.__alertBannerTimer);
+                        window.__alertBannerTimer = setTimeout(() => {
+                            banner.style.display = 'none';
+                        }, 10000);
                     }
                 }
 
                 // Cập nhật điểm Line Chart từ alert gần nhất
                 if (lineChart && data.alerts.length > 0) {
-                    const recentScores = data.alerts.slice(0, 6).map(a => a.score).reverse();
+                    const recentScores = data.alerts.slice(0, 6).map(a => Number(a.score || 0)).reverse();
                     if (recentScores.length > 0) {
                         lineChart.data.datasets[0].data = recentScores;
                         lineChart.update();
@@ -855,6 +929,13 @@ HTML_TEMPLATE = """
                 let html = '';
                 for (const a of data.alerts) {
                     const cd = data.countdowns[a.id];
+                    const scoreVal = Number(a.score || 0);
+                    const tsRaw = a.ts || a.alert_timestamp || a.created_at || '';
+                    const tsText = tsRaw
+                        ? String(tsRaw).replace('T', ' ').replace('Z', '').substring(0, 19)
+                        : '-';
+                    const attackType = (a.attack_type || 'unknown').toUpperCase();
+                    const severity = a.severity || '-';
                     let cdHtml = '-';
                     let actionHtml = '-';
 
@@ -864,12 +945,19 @@ HTML_TEMPLATE = """
                             <button class="btn btn-danger" onclick="blockAlert(${a.id})">Chặn</button>
                             <button class="btn btn-secondary" onclick="ignoreAlert(${a.id})">Bỏ qua</button>
                         `;
+                    } else if (a.status === 'new') {
+                        actionHtml = `
+                            <button class="btn btn-danger" onclick="blockAlert(${a.id})">Chặn</button>
+                            <button class="btn btn-secondary" onclick="ignoreAlert(${a.id})">Bỏ qua</button>
+                        `;
                     } else if (a.status === 'auto_blocked') {
                         actionHtml = '<span class="badge badge-danger">Tự chặn</span>';
                     } else if (a.status === 'manual_blocked') {
                         actionHtml = '<span class="badge badge-warning">Chặn tay</span>';
-                    } else if (a.status === 'ignored') {
-                        actionHtml = '<span class="badge badge-info">Đã bỏ qua</span>';
+                    } else if (a.status === 'ignored' || a.status === 'false_positive') {
+                        actionHtml = '<span class="badge badge-info">Cảnh báo nhầm</span>';
+                    } else if (a.status === 'confirmed') {
+                        actionHtml = '<span class="badge badge-success">Đã xác nhận</span>';
                     } else if (a.status === 'alerted') {
                         actionHtml = `
                             <span class="badge badge-warning">⚠️ Cảnh báo</span>
@@ -877,18 +965,30 @@ HTML_TEMPLATE = """
                         `;
                     }
 
-                    const sevBadge = a.severity === 'Cao' ? 'badge-danger' : 'badge-warning';
+                    const sevBadge = /cao|high|critical/i.test(severity) ? 'badge-danger' : 'badge-warning';
+                    const statusLabels = {
+                        new: 'Mới',
+                        alerted: 'Cảnh báo',
+                        confirmed: 'Đã xác nhận',
+                        false_positive: 'Cảnh báo nhầm',
+                        pending: 'Đang chờ',
+                        auto_blocked: 'Tự động chặn',
+                        manual_blocked: 'Chặn thủ công',
+                        ignored: 'Đã bỏ qua'
+                    };
+                    const statusLabel = statusLabels[a.status] || a.status || '-';
+                    const detailBtn = `<button class="btn btn-secondary" style="margin-left:6px; padding:3px 8px;" onclick="showAlertDetail(${a.id})">Chi tiết</button>`;
 
                     html += `<tr>
                         <td>#${a.id}</td>
-                        <td style="font-size:0.75rem; color:#94a3b8;">${a.ts.replace('T', ' ').substring(0, 19)}</td>
+                        <td style="font-size:0.75rem; color:#94a3b8;">${tsText}</td>
                         <td><strong>${a.src_ip}</strong></td>
-                        <td><span class="badge badge-info">${a.attack_type.toUpperCase()}</span></td>
-                        <td><strong>${a.score.toFixed(4)}</strong></td>
-                        <td><span class="badge ${sevBadge}">${a.severity}</span></td>
-                        <td>${a.status === 'alerted' ? 'Cảnh báo' : a.status}</td>
+                        <td><span class="badge badge-info">${attackType}</span></td>
+                        <td><strong>${scoreVal.toFixed(4)}</strong></td>
+                        <td><span class="badge ${sevBadge}">${severity}</span></td>
+                        <td>${statusLabel}</td>
                         <td>${cdHtml}</td>
-                        <td>${actionHtml}</td>
+                        <td>${actionHtml}${detailBtn}</td>
                     </tr>`;
                 }
                 tbody.innerHTML = html;
@@ -908,6 +1008,64 @@ HTML_TEMPLATE = """
             await fetch(`/api/alerts/${id}/ignore`, { method: 'POST' });
             fetchAlerts();
             updateCharts();
+        }
+
+        async function showAlertDetail(id) {
+            const modal = document.getElementById('alert-detail-modal');
+            const body = document.getElementById('alert-detail-body');
+            body.innerText = 'Đang tải hồ sơ bằng chứng...';
+            modal.style.display = 'flex';
+            try {
+                const res = await fetch(`/api/alerts/${id}/detail`);
+                const data = await res.json();
+                if (!res.ok) {
+                    body.innerText = data.message || 'Không tải được chi tiết cảnh báo';
+                    return;
+                }
+                const a = data.alert || {};
+                const ev = data.raw_event || {};
+                const lines = [];
+                lines.push(`CẢNH BÁO #${a.id}  |  ${(a.attack_type || '').toUpperCase()}  |  ${a.severity}`);
+                lines.push(`Thời gian     : ${String(a.ts || a.alert_timestamp || a.created_at || '-').replace('T', ' ').replace('Z', '').substring(0, 19)}`);
+                lines.push(`Nguồn -> Đích : ${a.src_ip} -> ${a.dest_ip || '-'}`);
+                lines.push(`Điểm EMA S_t  : ${Number(a.score || 0).toFixed(4)}   | Độ tin cậy: ${Number(a.confidence || 0).toFixed(4)}`);
+                lines.push(`Nguồn phát hiện: ${a.source_of_detection || '-'}   | Trạng thái: ${a.status}`);
+                lines.push('');
+                lines.push('--- WEB INDICATORS ---');
+                const web = (data.evidence && data.evidence.web_indicators) || {};
+                lines.push(`URL          : ${web.url || '-'}`);
+                lines.push(`Method/Status: ${web.http_method || '-'} / ${web.status || '-'}`);
+                lines.push(`User-Agent   : ${web.user_agent || '-'}`);
+                lines.push(`Hostname     : ${web.hostname || '-'}`);
+                lines.push('');
+                lines.push('--- SURICATA ---');
+                const suri = (data.evidence && data.evidence.suricata) || {};
+                lines.push(`Signature    : ${suri.signature || '-'}`);
+                lines.push(`Category     : ${suri.category || '-'}   | Severity: ${suri.severity ?? '-'}`);
+                lines.push('');
+                lines.push('--- AI PREDICTIONS (PostgreSQL) ---');
+                if (data.predictions && data.predictions.length) {
+                    for (const p of data.predictions) {
+                        lines.push(`• ${p.model_name}: ${p.predicted_label} | confidence=${Number(p.confidence || 0).toFixed(4)} | risk=${p.risk_level} | ${Number(p.inference_latency_ms || 0).toFixed(2)}ms`);
+                    }
+                } else {
+                    lines.push('(không có bản ghi ai_predictions)');
+                }
+                lines.push('');
+                lines.push(`--- RAW EVENT #${ev.id || (data.evidence && data.evidence.event_id) || '-'} ---`);
+                if (ev.raw_json) {
+                    lines.push(JSON.stringify(ev.raw_json, null, 2));
+                } else if (data.evidence) {
+                    lines.push(JSON.stringify(data.evidence, null, 2));
+                }
+                body.innerText = lines.join('\\n');
+            } catch (e) {
+                body.innerText = 'Lỗi tải chi tiết: ' + e;
+            }
+        }
+
+        function closeAlertDetail() {
+            document.getElementById('alert-detail-modal').style.display = 'none';
         }
 
         async function clearAlerts() {
@@ -1042,9 +1200,60 @@ HTML_TEMPLATE = """
             }, 1000);
         };
     </script>
+    <!-- Modal hồ sơ bằng chứng cảnh báo -->
+    <div id="alert-detail-modal" style="display:none; position:fixed; inset:0; background:rgba(2,6,23,0.85); z-index:9999; align-items:center; justify-content:center; padding:24px;">
+        <div style="background:var(--bg-card); border:1px solid var(--border-color); border-radius:10px; width:min(980px, 96vw); max-height:90vh; display:flex; flex-direction:column; box-shadow:0 20px 60px rgba(0,0,0,0.6);">
+            <div style="display:flex; align-items:center; justify-content:space-between; padding:16px 20px; border-bottom:1px solid var(--border-color);">
+                <h3 style="margin:0; color:var(--accent-blue);">Hồ Sơ Bằng Chứng Cảnh Báo</h3>
+                <button class="btn btn-secondary" onclick="closeAlertDetail()">Đóng</button>
+            </div>
+            <div style="padding:16px 20px; overflow:auto;">
+                <pre id="alert-detail-body" style="white-space:pre-wrap; word-break:break-word; font-size:0.8rem; line-height:1.45; margin:0; color:var(--text-main);"></pre>
+            </div>
+        </div>
+    </div>
 </body>
 </html>
 """
+
+
+def _session_alert_cutoff(include_history: bool = False) -> str | None:
+    """Mốc thời gian lọc cảnh báo hiển thị trên dashboard.
+
+    - Mặc định chỉ trả về cảnh báo phát sinh trong phiên chạy hiện tại
+      (``alert.show_only_current_session: true`` trong config.yaml).
+    - ``include_history=True`` (nút "Hiện cảnh báo cũ") trả về toàn bộ lịch sử.
+    """
+    if include_history:
+        return None
+    cfg = APP_CONTEXT.get("config") or {}
+    alert_cfg = cfg.get("alert") or {}
+    if not bool(alert_cfg.get("show_only_current_session", True)):
+        return None
+    return APP_CONTEXT.get("session_started_at")
+
+
+def _include_history_requested() -> bool:
+    return str(request.args.get("include_history", "0")).lower() in ("1", "true", "yes")
+
+
+def _get_pg_store():
+    """Lấy PostgresStore dùng chung; tự khởi tạo khi chỉ chạy riêng dashboard."""
+    store = APP_CONTEXT.get("pg_store")
+    if store is not None:
+        return store
+    try:
+        from src.pg_store import PostgresStore
+
+        cfg = APP_CONTEXT.get("config") or _load_config_from_file()
+        store = PostgresStore(cfg.get("database", {}))
+        if store.enabled:
+            store.init_schema()
+        APP_CONTEXT["pg_store"] = store
+        return store
+    except Exception as ex:
+        logger.warning("Không khởi tạo được PostgresStore cho dashboard: %s", ex)
+        return None
 
 
 @app.route("/")
@@ -1067,7 +1276,13 @@ def api_status():
     else:
         model_status = "Heuristic (Dự phòng)"
 
-    processed_events = collector.processed_events if collector else 0
+    store = _get_pg_store()
+    pipeline = store.get_pipeline_stats() if store is not None else {}
+    if pipeline.get("enabled"):
+        processed_events = int(pipeline.get("raw_processed", 0))
+    else:
+        processed_events = collector.processed_events if collector else 0
+
     stats = get_stats()
     pf = APP_CONTEXT.get("pfsense_collector")
     pf_status = pf.get_status() if pf and hasattr(pf, "get_status") else None
@@ -1078,6 +1293,7 @@ def api_status():
         "processed_events": processed_events,
         "blocked_count": stats.get("active_blocked_count", 0),
         "pfsense": pf_status,
+        "pipeline": pipeline,
     })
 
 
@@ -1094,10 +1310,41 @@ def api_pfsense():
 
 @app.route("/api/alerts", methods=["GET"])
 def api_alerts():
-    alerts = get_alerts(limit=50)
+    include_history = _include_history_requested()
+    since = _session_alert_cutoff(include_history)
+    alerts = get_alerts(limit=50, since=since)
     alert_mgr = APP_CONTEXT.get("alert_manager")
     countdowns = alert_mgr.get_active_countdowns() if alert_mgr else {}
-    return jsonify({"alerts": alerts, "countdowns": countdowns})
+    return jsonify({
+        "alerts": alerts,
+        "countdowns": countdowns,
+        "session_started_at": APP_CONTEXT.get("session_started_at"),
+        "showing_history": include_history,
+    })
+
+
+@app.route("/api/alerts/<int:alert_id>/detail", methods=["GET"])
+def api_alert_detail(alert_id: int):
+    """Hồ sơ bằng chứng đầy đủ của một cảnh báo (alert + raw event + AI predictions)."""
+    alert = get_alert_by_id(alert_id)
+    if not alert:
+        return jsonify({"success": False, "message": "Không tìm thấy cảnh báo"}), 404
+
+    evidence = alert.get("evidence") or {}
+    event_id = evidence.get("event_id") if isinstance(evidence, dict) else None
+    raw_event = None
+    predictions: list[dict] = []
+    store = _get_pg_store()
+    if store is not None and event_id:
+        raw_event = store.get_event(int(event_id))
+        predictions = store.get_predictions_for_event(int(event_id))
+
+    return jsonify({
+        "alert": alert,
+        "evidence": evidence,
+        "raw_event": raw_event,
+        "predictions": predictions,
+    })
 
 
 @app.route("/api/alerts/clear", methods=["POST"])
@@ -1173,7 +1420,9 @@ def api_delete_whitelist():
 
 @app.route("/api/stats", methods=["GET"])
 def api_stats():
-    return jsonify(get_stats())
+    include_history = _include_history_requested()
+    since = _session_alert_cutoff(include_history)
+    return jsonify(get_stats(since=since))
 
 
 def _load_config_from_file() -> dict[str, Any]:
